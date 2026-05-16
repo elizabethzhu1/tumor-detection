@@ -1,0 +1,7 @@
+certifi
+numpy
+pandas
+scipy
+scikit-learn
+torch
+xgboost
