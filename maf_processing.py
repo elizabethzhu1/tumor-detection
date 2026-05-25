@@ -13,7 +13,7 @@ Two paths:
    tumor-type-specific COSMIC-like signatures, so we can build and test
    the entire ML pipeline before the real data is downloaded.
 
-For TCGA, MAF files for each project (BRCA, ESCA, LAML, SKCM) are available
+For TCGA, MAF files for each project (SKCM, LUAD, BRCA, UCEC, COAD) are available
 from the GDC Data Portal:
     https://portal.gdc.cancer.gov/
 You typically want the 'Aliquot Ensemble Somatic Mutation' MAFs, one row per
@@ -154,7 +154,7 @@ def _make_signature(peaks, n_categories=96, noise=0.02, seed=None):
 
 def generate_synthetic_data(n_per_class=200, mutations_per_sample=(50, 5000), seed=0):
     """
-    Make fake mutation count data for 4 tumor types, each driven by a different
+    Make fake mutation count data for 5 tumor types, each driven by a different
     mixture of toy 'signatures' loosely inspired by COSMIC SBS dominant peaks.
 
     Returns a DataFrame in the same shape as parse_maf_file.
@@ -166,22 +166,33 @@ def generate_synthetic_data(n_per_class=200, mutations_per_sample=(50, 5000), se
     sig_uv = _make_signature({CATEGORIES.index("C[C>T]C"): 0.4,
                               CATEGORIES.index("T[C>T]C"): 0.3,
                               CATEGORIES.index("C[C>T]T"): 0.2}, seed=1)  # SKCM-like
+    sig_smoking = _make_signature({CATEGORIES.index("C[C>A]A"): 0.25,
+                                   CATEGORIES.index("C[C>A]C"): 0.20,
+                                   CATEGORIES.index("T[C>A]A"): 0.20,
+                                   CATEGORIES.index("T[C>A]T"): 0.15}, seed=5)  # LUAD-like
     sig_apobec = _make_signature({CATEGORIES.index("T[C>T]A"): 0.35,
                                   CATEGORIES.index("T[C>G]A"): 0.3,
                                   CATEGORIES.index("T[C>T]T"): 0.15}, seed=2)  # BRCA
+    sig_hrd = _make_signature({CATEGORIES.index("T[T>A]A"): 0.20,
+                               CATEGORIES.index("T[T>G]T"): 0.18,
+                               CATEGORIES.index("C[T>A]T"): 0.16}, seed=6)  # BRCA HRD-like
     sig_age = _make_signature({CATEGORIES.index("A[C>T]G"): 0.15,
                                CATEGORIES.index("C[C>T]G"): 0.18,
                                CATEGORIES.index("G[C>T]G"): 0.15,
-                               CATEGORIES.index("T[C>T]G"): 0.15}, seed=3)  # LAML
-    sig_esca = _make_signature({CATEGORIES.index("C[T>C]T"): 0.3,
-                                CATEGORIES.index("T[T>C]T"): 0.25,
-                                CATEGORIES.index("A[T>C]T"): 0.2}, seed=4)  # ESCA
+                               CATEGORIES.index("T[C>T]G"): 0.15}, seed=3)  # SBS1/5-like aging
+    sig_pole = _make_signature({CATEGORIES.index("T[C>A]T"): 0.30,
+                                CATEGORIES.index("T[C>G]T"): 0.25,
+                                CATEGORIES.index("A[C>A]A"): 0.15}, seed=4)  # UCEC/COAD POLE-like
+    sig_mmr = _make_signature({CATEGORIES.index("A[C>T]A"): 0.20,
+                               CATEGORIES.index("C[C>T]A"): 0.18,
+                               CATEGORIES.index("G[C>T]A"): 0.16}, seed=7)  # UCEC/COAD MMR-like
 
     tumor_specs = {
-        "SKCM": {"primary": sig_uv,     "secondary": sig_age, "p_mix": 0.85},
-        "BRCA": {"primary": sig_apobec, "secondary": sig_age, "p_mix": 0.70},
-        "LAML": {"primary": sig_age,    "secondary": sig_apobec, "p_mix": 0.80},
-        "ESCA": {"primary": sig_esca,   "secondary": sig_age, "p_mix": 0.65},
+        "SKCM": {"primary": sig_uv,      "secondary": sig_age, "p_mix": 0.85},
+        "LUAD": {"primary": sig_smoking, "secondary": sig_age, "p_mix": 0.75},
+        "BRCA": {"primary": sig_apobec,  "secondary": 0.5 * sig_hrd + 0.5 * sig_age, "p_mix": 0.60},
+        "UCEC": {"primary": sig_pole,    "secondary": sig_mmr, "p_mix": 0.55},
+        "COAD": {"primary": sig_mmr,     "secondary": sig_pole, "p_mix": 0.65},
     }
 
     rows = []

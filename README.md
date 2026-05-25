@@ -47,10 +47,15 @@ python run_pipeline.py \
 ```
 
 By default this downloads:
-- `TCGA-BRCA` as `BRCA`
-- `TCGA-ESCA` as `ESCA`
-- `TCGA-LAML` as `LAML`
 - `TCGA-SKCM` as `SKCM`
+- `TCGA-LUAD` as `LUAD`
+- `TCGA-BRCA` as `BRCA`
+- `TCGA-UCEC` as `UCEC`
+- `TCGA-COAD` as `COAD`
+
+These defaults target tumor types with strong expected mutational signatures:
+SKCM/UV (`SBS7`), LUAD/smoking (`SBS4`), BRCA/APOBEC-HRD-aging
+(`SBS2/13/3/1/5`), UCEC/POLE-MMR (`SBS10/6`), and COAD/MMR-POLE.
 
 Downloaded MAFs are cached under `data/tcga_mafs/`. The 96-dimensional count
 matrix is written to `outputs/spectra_counts.csv`; metrics and learned

@@ -217,8 +217,8 @@ def main():
     parser.add_argument("--tcga-projects", nargs="*",
                         default=[f"{p}:{label}" for p, label in DEFAULT_TCGA_PROJECTS.items()],
                         help=("TCGA projects to download as PROJECT:LABEL. "
-                              "Default: TCGA-BRCA:BRCA TCGA-ESCA:ESCA "
-                              "TCGA-LAML:LAML TCGA-SKCM:SKCM."))
+                              "Default: TCGA-SKCM:SKCM TCGA-LUAD:LUAD "
+                              "TCGA-BRCA:BRCA TCGA-UCEC:UCEC TCGA-COAD:COAD."))
     parser.add_argument("--data-dir", default="data/tcga_mafs",
                         help="Directory for downloaded TCGA MAFs.")
     parser.add_argument("--force-download", action="store_true",

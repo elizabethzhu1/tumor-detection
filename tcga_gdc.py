@@ -23,10 +23,11 @@ except ImportError:
 
 GDC_API_BASE = "https://api.gdc.cancer.gov"
 DEFAULT_TCGA_PROJECTS = {
-    "TCGA-BRCA": "BRCA",
-    "TCGA-ESCA": "ESCA",
-    "TCGA-LAML": "LAML",
     "TCGA-SKCM": "SKCM",
+    "TCGA-LUAD": "LUAD",
+    "TCGA-BRCA": "BRCA",
+    "TCGA-UCEC": "UCEC",
+    "TCGA-COAD": "COAD",
 }
 DEFAULT_WORKFLOW = "Aliquot Ensemble Somatic Variant Merging and Masking"
 
