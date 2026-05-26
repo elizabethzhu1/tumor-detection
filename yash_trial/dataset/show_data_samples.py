@@ -6,7 +6,7 @@ import gzip
 import io
 import pandas as pd
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
+ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT_DIR))
 
 from maf_processing import parse_maf_file, _find_column, _open_maybe_gz
@@ -62,7 +62,7 @@ def show_two_samples_per_project(data_dir: Path):
 
 
 def main():
-    data_dir = Path(__file__).resolve().parent.parent / "data" / "tcga_mafs"
+    data_dir = Path(__file__).resolve().parent.parent.parent / "data" / "tcga_mafs"
     show_two_samples_per_project(data_dir)
 
 

@@ -8,7 +8,7 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
+ROOT_DIR = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT_DIR))
 
 from maf_processing import _find_column, _open_maybe_gz, CATEGORIES, classify_mutation, _trinuc_from_context, BASES
@@ -194,8 +194,8 @@ def _plot_combined_trinucleotide(plot_data: dict, output_dir: Path):
 
 
 def main():
-    data_dir = Path(__file__).resolve().parent.parent / "data" / "tcga_mafs"
-    output_dir = Path(__file__).resolve().parent / "plots"
+    data_dir = Path(__file__).resolve().parent.parent.parent / "data" / "tcga_mafs"
+    output_dir = Path(__file__).resolve().parent.parent / "plots"
     
     if not data_dir.exists():
         raise SystemExit(f"Data directory not found: {data_dir}")
