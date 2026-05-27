@@ -33,7 +33,7 @@ from cosmic import load_cosmic_signatures, fit_exposures
 from model import train_model, predict
 from evaluation import (classification_metrics, hungarian_match_to_cosmic,
                          null_alignment_score)
-from processed_data import (
+from data_processing_helpers import (
     DEFAULT_PROCESSED_DATA,
     encode_spectra,
     load_maf_spectra,

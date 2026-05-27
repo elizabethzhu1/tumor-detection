@@ -10,7 +10,7 @@ mutation_categories.py   # 96-category definitions + mutation classification
 maf_processing.py        # GDC MAF parsing
 tcga_gdc.py              # TCGA MAF discovery/download through the GDC API
 cosmic.py                # COSMIC signature loading + NNLS exposure fitting
-processed_data.py        # Shared processed spectra cache loading/building
+data_processing_helpers.py # Shared processed spectra cache loading/building
 process_data.py          # One-time raw MAF -> processed spectra command
 model.py                 # Bottleneck NN (Linear + softplus weights + softmax)
 evaluation.py            # Metrics + Hungarian-matched COSMIC alignment + null
@@ -118,12 +118,45 @@ For real COSMIC exposure baselines and alignment, download the GRCh38 SBS v3.x
 TSV from https://cancer.sanger.ac.uk/signatures/sbs/ and pass it with
 `--cosmic-path`. A real COSMIC signature file is required.
 
+To compare COSMIC signatures against the basic NN bottleneck input-attribution
+patterns:
+
+```bash
+.venv/bin/python analyze_cosmic_attribution.py
+```
+
+This writes COSMIC signature plots, a bottleneck-vs-COSMIC cosine similarity
+matrix, and top-match summaries under `outputs/basic_nn_cosmic_attribution_*`.
+
+When the basic NN is trained with `--bottleneck-dim`, its visualization step
+also writes class-split interpretability files:
+
+- `outputs/basic_nn_class_weighted_bottleneck_input_attributions.csv`: one
+  nonnegative 96-bin pattern per output class, computed as the positive
+  classifier-weighted sum of bottleneck-unit input patterns.
+- `outputs/basic_nn_class_logit_input_attributions.csv`: one 96-bin gradient
+  attribution pattern per output class logit, averaged over samples from that
+  true tumor type.
+- `outputs/basic_nn_bottleneck_input_attributions_by_class.csv`: one 96-bin
+  pattern for each `(tumor_type, bottleneck_unit)` pair.
+
+Compare any of these against COSMIC by passing it to `--attributions`, for
+example:
+
+```bash
+.venv/bin/python analyze_cosmic_attribution.py \
+  --attributions outputs/basic_nn_class_weighted_bottleneck_input_attributions.csv \
+  --out-prefix outputs/basic_nn_class_weighted_cosmic_attribution
+```
+
 ## Current State
 
 - **No reference-genome lookup.** Uses the GDC MAF `CONTEXT` column.
 - **No hyperparameter search.** Just sensible defaults.
 - **No batch training.** Full-batch Adam, fine for ~10^3 samples × 96 features.
 - **No early stopping plot.** Best val checkpoint is saved internally.
-- **No visualization.** Plot the learned signatures by reading
-  `results.json["bottleneck_nn"][K]["learned_weights"]` as 96-bar plots.
+- **Limited end-to-end visualization.** Pipeline learned signatures can still be
+  plotted from `results.json["bottleneck_nn"][K]["learned_weights"]`; the
+  basic NN bottleneck attribution comparison has its own
+  `analyze_cosmic_attribution.py` plots.
 # tumor-detection
