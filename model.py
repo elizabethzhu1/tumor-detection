@@ -43,7 +43,8 @@ class BottleneckClassifier(nn.Module):
 
 
 def train_model(X_train, y_train, X_val, y_val, K=8, n_classes=4,
-                epochs=200, lr=1e-2, weight_decay=1e-4, verbose=True):
+                epochs=200, lr=1e-2, weight_decay=1e-4, verbose=True,
+                print_every=25):
     """Train the bottleneck classifier with simple full-batch Adam."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = BottleneckClassifier(n_features=X_train.shape[1], K=K,
@@ -81,9 +82,11 @@ def train_model(X_train, y_train, X_val, y_val, K=8, n_classes=4,
             best_state = {k: v.detach().cpu().clone()
                           for k, v in model.state_dict().items()}
 
-        if verbose and (epoch % 25 == 0 or epoch == epochs - 1):
+        should_print = print_every is not None and print_every > 0
+        if verbose and should_print and (epoch % print_every == 0 or epoch == epochs - 1):
             print(f"  epoch {epoch:3d}: loss {loss.item():.4f} "
-                  f"val_loss {v_loss:.4f} train_acc {t_acc:.3f} val_acc {v_acc:.3f}")
+                  f"val_loss {v_loss:.4f} train_acc {t_acc:.3f} val_acc {v_acc:.3f}",
+                  flush=True)
 
     if best_state is not None:
         model.load_state_dict(best_state)

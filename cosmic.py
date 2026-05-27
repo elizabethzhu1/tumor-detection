@@ -6,9 +6,9 @@ The COSMIC catalogue is downloadable from:
 Use the GRCh38 SBS v3.x file. It comes as a TSV with one row per mutation type
 ('A[C>A]A' style) and one column per signature ('SBS1', 'SBS2', ...).
 
-For development without the file, we synthesize a dictionary of toy signatures
-that matches the same shape and ordering.
 """
+
+import argparse
 
 import numpy as np
 import pandas as pd
@@ -17,18 +17,16 @@ from scipy.optimize import nnls
 from mutation_categories import CATEGORIES
 
 
-def load_cosmic_signatures(path=None):
+def load_cosmic_signatures(path):
     """
     Load COSMIC SBS signatures as a (96, n_signatures) matrix.
 
     Returns (matrix, signature_names).
-    If path is None, returns synthetic placeholder signatures so the rest of
-    the pipeline can run.
     """
     if path is None:
-        return _synthetic_cosmic()
+        raise ValueError("A real COSMIC SBS signatures file is required.")
 
-    df = pd.read_csv(path, sep="\t")
+    df = pd.read_csv(path, sep=None, engine="python")
     # COSMIC files use a "Type" or "Substitution Type"/"Trinucleotide" column.
     # We expect categories in 'A[C>A]A' format. Normalize if needed.
     if "Type" in df.columns:
@@ -43,14 +41,6 @@ def load_cosmic_signatures(path=None):
     if df.isna().any().any():
         raise ValueError("Some categories missing after reindexing; check format.")
     return df.values, list(df.columns)
-
-
-def _synthetic_cosmic(n_signatures=20, seed=42):
-    """Generate placeholder signatures for development."""
-    rng = np.random.default_rng(seed)
-    mat = rng.dirichlet(alpha=np.ones(96) * 0.3, size=n_signatures).T  # (96, n_sig)
-    names = [f"SBS_synth_{i+1}" for i in range(n_signatures)]
-    return mat, names
 
 
 def fit_exposures(spectra, signatures):
@@ -77,12 +67,10 @@ def fit_exposures(spectra, signatures):
 
 
 if __name__ == "__main__":
-    sigs, names = load_cosmic_signatures()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("path", help="COSMIC SBS signatures TSV/CSV path.")
+    args = parser.parse_args()
+
+    sigs, names = load_cosmic_signatures(args.path)
     print(f"Loaded {len(names)} signatures, matrix shape {sigs.shape}")
     print(f"Each signature sums to ~1: {sigs.sum(axis=0)[:3]}")
-
-    # Fit on dummy spectra.
-    rng = np.random.default_rng(0)
-    fake_spectra = rng.dirichlet(np.ones(96) * 0.5, size=10)
-    expos = fit_exposures(fake_spectra, sigs)
-    print(f"Exposures shape: {expos.shape}, row sums: {expos.sum(axis=1)[:3]}")

@@ -2,7 +2,7 @@
 End-to-end MVP pipeline.
 
 Steps:
-  1) Load data (synthetic or real MAFs).
+  1) Load real MAF data.
   2) Split into train/val/test (70/15/15, stratified).
   3) Train baselines: logistic regression on raw spectra, logistic regression
      on COSMIC exposures, XGBoost on raw spectra.
@@ -16,13 +16,10 @@ Steps:
 import argparse
 import json
 import os
-from pathlib import Path
 
 import numpy as np
-import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
 
 # Optional XGBoost — skip if not installed.
 try:
@@ -31,50 +28,18 @@ try:
 except ImportError:
     HAS_XGB = False
 
-from mutation_categories import CATEGORIES
-from maf_processing import generate_synthetic_data, counts_to_probs, parse_maf_file
 from tcga_gdc import DEFAULT_TCGA_PROJECTS, download_tcga_mafs, parse_project_specs
 from cosmic import load_cosmic_signatures, fit_exposures
 from model import train_model, predict
 from evaluation import (classification_metrics, hungarian_match_to_cosmic,
                          null_alignment_score)
-
-
-def load_data(synthetic=True, maf_paths=None, n_per_class=300, seed=0):
-    """
-    Returns:
-      X_probs: (n, 96) probability spectra
-      y: array of integer labels
-      class_names: list, label index -> tumor type string
-      sample_ids: list of sample ids
-      spectra_df: DataFrame with sample_id, tumor_type, and 96 count columns
-    """
-    if synthetic:
-        df = generate_synthetic_data(n_per_class=n_per_class, seed=seed)
-    else:
-        if not maf_paths:
-            raise ValueError("Real-data mode requires --maf-paths or --download-tcga-mafs.")
-        dfs = []
-        for tumor, paths in maf_paths.items():
-            if isinstance(paths, (str, os.PathLike)):
-                paths = [paths]
-            tumor_dfs = []
-            for path in paths:
-                print(f"  parsing {path} as {tumor}...")
-                tumor_dfs.append(parse_maf_file(path, tumor))
-            tumor_df = pd.concat(tumor_dfs, ignore_index=True)
-            tumor_df = (
-                tumor_df.groupby(["sample_id", "tumor_type"], as_index=False)[CATEGORIES]
-                .sum()
-            )
-            dfs.append(tumor_df)
-        df = pd.concat(dfs, ignore_index=True)
-
-    counts = df[CATEGORIES].values.astype(np.float64)
-    probs = counts_to_probs(counts).astype(np.float32)
-    le = LabelEncoder()
-    y = le.fit_transform(df["tumor_type"].values)
-    return probs, y, list(le.classes_), df["sample_id"].tolist(), df
+from processed_data import (
+    DEFAULT_PROCESSED_DATA,
+    encode_spectra,
+    load_maf_spectra,
+    load_or_build_spectra,
+    save_spectra_counts,
+)
 
 
 def stratified_three_split(X, y, train_frac=0.70, val_frac=0.15, seed=0):
@@ -113,23 +78,27 @@ def run_baselines(X_tr, y_tr, X_va, y_va, X_te, y_te, signatures, class_names):
     if HAS_XGB:
         print("Training XGBoost on raw spectra...")
         xgb = XGBClassifier(n_estimators=200, max_depth=4, learning_rate=0.1,
-                            objective="multi:softprob", verbosity=0)
+                            objective="multi:softprob", num_class=len(class_names),
+                            eval_metric="mlogloss", verbosity=0)
         xgb.fit(X_tr, y_tr)
+        xgb_pred = xgb.predict(X_te)
+        if np.ndim(xgb_pred) > 1:
+            xgb_pred = np.asarray(xgb_pred).argmax(axis=1)
         results["xgboost_raw"] = classification_metrics(
-            y_te, xgb.predict(X_te), class_names=class_names)
+            y_te, xgb_pred, class_names=class_names)
 
     return results, (expos_tr, expos_va, expos_te)
 
 
 def run_bottleneck_sweep(X_tr, y_tr, X_va, y_va, X_te, y_te, n_classes,
                           K_values, signatures, sig_names, class_names,
-                          seed=0, epochs=300):
+                          seed=0, epochs=300, epoch_print_every=1):
     """Train the bottleneck model for several K and report metrics + alignment."""
     results = {}
     null_cache = {}
 
     for K in K_values:
-        print(f"\nTraining bottleneck NN with K={K}...")
+        print(f"\nTraining bottleneck NN with K={K}...", flush=True)
         # Reproducibility within the sweep.
         import torch
         torch.manual_seed(seed)
@@ -137,7 +106,8 @@ def run_bottleneck_sweep(X_tr, y_tr, X_va, y_va, X_te, y_te, n_classes,
 
         model, _ = train_model(X_tr, y_tr, X_va, y_va,
                                 K=K, n_classes=n_classes,
-                                epochs=epochs, lr=1e-2, verbose=False)
+                                epochs=epochs, lr=1e-2, verbose=True,
+                                print_every=epoch_print_every)
         preds_te, _ = predict(model, X_te)
         cls_metrics = classification_metrics(y_te, preds_te, class_names=class_names)
 
@@ -198,20 +168,8 @@ def parse_maf_path_args(maf_path_args):
     return out
 
 
-def save_spectra_counts(spectra_df, out_path):
-    """Save per-sample 96-dimensional count spectra."""
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    columns = ["sample_id", "tumor_type"] + CATEGORIES
-    spectra_df.loc[:, columns].to_csv(out_path, index=False)
-
-
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--synthetic", action="store_true", default=True,
-                        help="Use synthetic data (default for MVP).")
-    parser.add_argument("--no-synthetic", dest="synthetic", action="store_false",
-                        help="Use real MAF files instead of synthetic data.")
     parser.add_argument("--download-tcga-mafs", action="store_true",
                         help="Download public TCGA MAFs from GDC before loading data.")
     parser.add_argument("--tcga-projects", nargs="*",
@@ -224,64 +182,74 @@ def main():
     parser.add_argument("--force-download", action="store_true",
                         help="Redownload TCGA MAFs even when cached files exist.")
     parser.add_argument("--max-files-per-project", type=int, default=None,
-                        help="Optional cap on downloaded MAF files per TCGA project.")
+                        help="Optional cap on MAF files per TCGA project.")
     parser.add_argument("--download-retries", type=int, default=3,
                         help="Retries for transient GDC file download failures.")
     parser.add_argument("--skip-failed-downloads", action="store_true",
                         help="Continue when one GDC MAF download fails after retries.")
     parser.add_argument("--maf-paths", nargs="*",
                         help="Real MAF inputs as LABEL=/path/to/file.maf.gz.")
-    parser.add_argument("--cosmic-path", default=None,
-                        help="Path to COSMIC SBS signatures TSV.")
-    parser.add_argument("--spectra-out", default="outputs/spectra_counts.csv",
-                        help="Where to save per-sample 96-d count spectra.")
+    parser.add_argument("--processed-data", default=DEFAULT_PROCESSED_DATA,
+                        help="Processed spectra CSV shared by all models.")
+    parser.add_argument("--reprocess-data", action="store_true",
+                        help="Reparse cached MAFs and overwrite --processed-data.")
+    parser.add_argument("--cosmic-path", required=True,
+                        help="Path to real COSMIC SBS signatures TSV/CSV.")
+    parser.add_argument("--spectra-out", default=None,
+                        help="Optional extra copy of per-sample 96-d count spectra.")
     parser.add_argument("--out", default="outputs/results.json")
-    parser.add_argument("--n-per-class", type=int, default=300,
-                        help="Synthetic samples per tumor type.")
     parser.add_argument("--K-values", type=int, nargs="+",
                         default=[4, 6, 8, 12, 16],
                         help="Bottleneck widths to train.")
     parser.add_argument("--epochs", type=int, default=300,
                         help="Training epochs for each bottleneck NN.")
+    parser.add_argument("--epoch-print-every", type=int, default=1,
+                        help="Print NN training metrics every N epochs.")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
-    if args.download_tcga_mafs or args.maf_paths:
-        args.synthetic = False
 
     print("=" * 60)
-    print("CosmicNet MVP pipeline")
+    print("CosmicNet real-data pipeline")
     print("=" * 60)
 
     print("\n[1/5] Loading data...")
-    maf_paths = None
-    if not args.synthetic:
-        maf_paths = parse_maf_path_args(args.maf_paths)
-        if args.download_tcga_mafs:
-            projects = parse_project_specs(args.tcga_projects)
-            downloaded = download_tcga_mafs(
-                projects=projects,
-                output_dir=args.data_dir,
-                force=args.force_download,
-                max_files_per_project=args.max_files_per_project,
-                retries=args.download_retries,
-                skip_failed_downloads=args.skip_failed_downloads,
-            )
-            if maf_paths:
-                for label, paths in downloaded.items():
-                    maf_paths.setdefault(label, []).extend(paths)
-            else:
-                maf_paths = downloaded
+    maf_paths = parse_maf_path_args(args.maf_paths)
+    if args.download_tcga_mafs:
+        projects = parse_project_specs(args.tcga_projects)
+        downloaded = download_tcga_mafs(
+            projects=projects,
+            output_dir=args.data_dir,
+            force=args.force_download,
+            max_files_per_project=args.max_files_per_project,
+            retries=args.download_retries,
+            skip_failed_downloads=args.skip_failed_downloads,
+        )
+        if maf_paths:
+            for label, paths in downloaded.items():
+                maf_paths.setdefault(label, []).extend(paths)
+        else:
+            maf_paths = downloaded
 
-    X, y, class_names, sample_ids, spectra_df = load_data(
-        synthetic=args.synthetic,
-        maf_paths=maf_paths,
-        n_per_class=args.n_per_class,
-        seed=args.seed,
-    )
+    if maf_paths is not None:
+        spectra_df = load_maf_spectra(maf_paths, verbose=True)
+        save_spectra_counts(spectra_df, args.processed_data)
+        data_source = "raw_mafs"
+    else:
+        spectra_df, data_source = load_or_build_spectra(
+            processed_data=args.processed_data,
+            data_dir=args.data_dir,
+            max_files_per_label=args.max_files_per_project,
+            force_reprocess=args.reprocess_data,
+            verbose=True,
+        )
+    X, y, class_names = encode_spectra(spectra_df)
     save_spectra_counts(spectra_df, args.spectra_out)
     print(f"  {X.shape[0]} samples, {X.shape[1]} features, "
           f"{len(class_names)} classes: {class_names}")
-    print(f"  96-d count spectra saved to {args.spectra_out}")
+    print(f"  data source: {data_source}")
+    print(f"  processed spectra: {args.processed_data}")
+    if args.spectra_out:
+        print(f"  spectra copy saved to {args.spectra_out}")
 
     print("\n[2/5] Splitting 70/15/15 stratified...")
     X_tr, X_va, X_te, y_tr, y_va, y_te = stratified_three_split(X, y, seed=args.seed)
@@ -302,13 +270,16 @@ def main():
     nn_results = run_bottleneck_sweep(
         X_tr, y_tr, X_va, y_va, X_te, y_te, n_classes=len(class_names),
         K_values=K_values, signatures=signatures, sig_names=sig_names,
-        class_names=class_names, seed=args.seed, epochs=args.epochs)
+        class_names=class_names, seed=args.seed, epochs=args.epochs,
+        epoch_print_every=args.epoch_print_every)
 
     out = {
-        "config": {"synthetic": args.synthetic, "seed": args.seed,
+        "config": {"seed": args.seed,
                    "class_names": class_names, "K_values": K_values,
                    "n_train": int(len(X_tr)), "n_val": int(len(X_va)),
                    "n_test": int(len(X_te)),
+                   "data_source": data_source,
+                   "processed_data": args.processed_data,
                    "spectra_out": args.spectra_out,
                    "maf_paths": maf_paths},
         "baselines": baseline_results,
