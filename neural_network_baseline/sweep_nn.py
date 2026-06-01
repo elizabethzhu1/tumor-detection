@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 from sklearn.metrics import f1_score
 from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -29,6 +29,11 @@ from neural_network_baseline.train_nn import (
     compute_class_weights,
     get_device,
     l1_penalty,
+)
+from maf_features import (
+    DEFAULT_DRIVER_GENES,
+    load_driver_genes,
+    load_or_build_driver_gene_features,
 )
 
 
@@ -49,9 +54,13 @@ def evaluate_split(model, X, y, device, label_smoothing=0.0):
         logits = model(Xt)
         loss = F.cross_entropy(logits, yt, label_smoothing=label_smoothing).item()
         pred = logits.argmax(dim=1).cpu().numpy()
+        max_k = min(3, logits.shape[1])
+        topk = logits.topk(max_k, dim=1).indices.cpu().numpy()
     return {
         "loss": float(loss),
         "accuracy": float((pred == y).mean()),
+        "top_2_accuracy": float(np.any(topk[:, :min(2, max_k)] == y[:, None], axis=1).mean()),
+        "top_3_accuracy": float(np.any(topk[:, :min(3, max_k)] == y[:, None], axis=1).mean()),
         "weighted_f1": float(f1_score(y, pred, average="weighted", zero_division=0)),
         "macro_f1": float(f1_score(y, pred, average="macro", zero_division=0)),
         "pred": pred,
@@ -89,11 +98,25 @@ def train_trial(config, splits, n_classes, device):
         torch.tensor(X_train, dtype=torch.float32),
         torch.tensor(y_train, dtype=torch.long),
     )
+    sampler = None
+    shuffle = True
+    if config.balanced_sampler:
+        class_counts = np.bincount(y_train, minlength=n_classes)
+        class_counts = np.maximum(class_counts, 1)
+        sample_weights = 1.0 / class_counts[y_train]
+        sampler = WeightedRandomSampler(
+            weights=torch.tensor(sample_weights, dtype=torch.float32),
+            num_samples=len(sample_weights),
+            replacement=True,
+            generator=torch.Generator().manual_seed(config.seed),
+        )
+        shuffle = False
     train_loader = DataLoader(
         train_ds,
         batch_size=config.batch_size,
-        shuffle=True,
-        generator=torch.Generator().manual_seed(config.seed),
+        shuffle=shuffle,
+        sampler=sampler,
+        generator=None if sampler is not None else torch.Generator().manual_seed(config.seed),
     )
 
     best_state = None
@@ -176,6 +199,7 @@ def build_grid(args):
         args.l1_lambda,
         args.include_mutation_burden,
         args.class_weighted,
+        args.balanced_sampler,
     ))
     configs = []
     for values in grid:
@@ -191,6 +215,7 @@ def build_grid(args):
             "l1_lambda": values[8],
             "include_mutation_burden": values[9],
             "class_weighted": values[10],
+            "balanced_sampler": values[11],
         })
 
     baseline = {
@@ -205,6 +230,7 @@ def build_grid(args):
         "l1_lambda": 0.0,
         "include_mutation_burden": True,
         "class_weighted": True,
+        "balanced_sampler": False,
     }
     configs.insert(0, baseline)
 
@@ -226,7 +252,15 @@ def build_grid(args):
     return deduped
 
 
-def make_splits(spectra_df, include_mutation_burden, labels, test_size, val_size, seed):
+def make_splits(
+    spectra_df,
+    include_mutation_burden,
+    labels,
+    test_size,
+    val_size,
+    seed,
+    driver_features_df=None,
+):
     work_df = spectra_df
     if labels is not None:
         work_df = work_df[work_df["tumor_type"].isin(set(labels))].copy()
@@ -235,6 +269,7 @@ def make_splits(spectra_df, include_mutation_burden, labels, test_size, val_size
     X, y, class_names, feature_names = build_features(
         work_df,
         include_mutation_burden=include_mutation_burden,
+        driver_features_df=driver_features_df,
     )
     X_train, X_tmp, y_train, y_tmp = train_test_split(
         X,
@@ -269,6 +304,7 @@ def trial_config_dict(config):
             "l1_lambda",
             "include_mutation_burden",
             "class_weighted",
+            "balanced_sampler",
             "epochs",
             "patience",
             "seed",
@@ -299,12 +335,30 @@ def main():
     parser.add_argument("--l1-lambda", type=float, nargs="+", default=[0.0, 1e-6])
     parser.add_argument("--include-mutation-burden", type=int, nargs="+", default=[1])
     parser.add_argument("--class-weighted", type=int, nargs="+", default=[1, 0])
+    parser.add_argument("--balanced-sampler", type=int, nargs="+", default=[0, 1])
+    parser.add_argument("--include-driver-genes", action="store_true")
+    parser.add_argument("--driver-feature-cache", default="data/processed/driver_gene_flags.csv")
+    parser.add_argument("--driver-gene-file", default=None)
+    parser.add_argument("--data-dir", default="data/tcga_mafs")
+    parser.add_argument("--force-driver-rebuild", action="store_true")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     device = get_device()
     spectra_df = load_spectra_counts(args.processed_data)
+    driver_features_df = None
+    if args.include_driver_genes:
+        driver_genes = (
+            load_driver_genes(args.driver_gene_file)
+            if args.driver_gene_file else DEFAULT_DRIVER_GENES
+        )
+        driver_features_df = load_or_build_driver_gene_features(
+            cache_path=args.driver_feature_cache,
+            data_dir=args.data_dir,
+            driver_genes=driver_genes,
+            force=args.force_driver_rebuild,
+        )
     configs = build_grid(args)
 
     print(f"Running {len(configs)} NN sweep trials on {device}.", flush=True)
@@ -325,6 +379,7 @@ def main():
                 args.test_size,
                 args.val_size,
                 args.seed,
+                driver_features_df=driver_features_df,
             )
         splits, class_names, feature_names, work_df = split_cache[include_burden]
         config = SimpleNamespace(
@@ -348,6 +403,8 @@ def main():
             "val_macro_f1": result["best_val"]["macro_f1"],
             "val_loss": result["best_val"]["loss"],
             "test_accuracy": result["test"]["accuracy"],
+            "test_top_2_accuracy": result["test"]["top_2_accuracy"],
+            "test_top_3_accuracy": result["test"]["top_3_accuracy"],
             "test_weighted_f1": result["test"]["weighted_f1"],
             "test_macro_f1": result["test"]["macro_f1"],
             "test_loss": result["test"]["loss"],
@@ -385,6 +442,9 @@ def main():
                         "test_size": args.test_size,
                         "val_size": args.val_size,
                         "selection_metric": "0.5 * (val_accuracy + val_weighted_f1)",
+                        "include_driver_genes": args.include_driver_genes,
+                        "driver_feature_cache": args.driver_feature_cache if args.include_driver_genes else None,
+                        "driver_gene_file": args.driver_gene_file if args.include_driver_genes else None,
                     },
                     "sweep_row": row,
                 },
@@ -395,7 +455,8 @@ def main():
             f"[{trial_idx:03d}/{len(configs):03d}] "
             f"val_obj={row['best_val_objective']:.4f} "
             f"val_acc={row['val_accuracy']:.4f} val_wf1={row['val_weighted_f1']:.4f} "
-            f"test_acc={row['test_accuracy']:.4f} test_wf1={row['test_weighted_f1']:.4f} "
+            f"test_acc={row['test_accuracy']:.4f} test_top2={row['test_top_2_accuracy']:.4f} "
+            f"test_wf1={row['test_weighted_f1']:.4f} "
             f"best={is_best} elapsed={elapsed:.1f}s "
             f"cfg={config_dict}",
             flush=True,
@@ -444,6 +505,7 @@ def main():
         "batch_size",
         "label_smoothing",
         "class_weighted",
+        "balanced_sampler",
     ]].to_string(index=False))
     print(f"\nBest model saved to {out_dir / 'best_model.pt'}")
     print(f"Sweep summary saved to {out_dir / 'sweep_summary.json'}")

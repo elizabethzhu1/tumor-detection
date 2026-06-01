@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -23,15 +23,35 @@ from maf_features import (
     driver_feature_names,
     load_driver_genes,
     load_or_build_driver_gene_features,
+    load_or_build_maf_summary_features,
+    load_or_build_top_mutated_gene_features,
 )
 from mutation_categories import CATEGORIES
 from data_processing_helpers import DEFAULT_PROCESSED_DATA, encode_spectra, load_spectra_counts
+from cosmic import fit_exposures, load_cosmic_signatures
 
 
-def build_features(spectra_df, include_mutation_burden=False, driver_features_df=None):
+def build_features(
+    spectra_df,
+    include_sbs96=True,
+    include_sbs96_log_counts=False,
+    include_mutation_burden=False,
+    driver_features_df=None,
+    maf_summary_df=None,
+    top_gene_features_df=None,
+    cosmic_exposures_df=None,
+):
     """Build model features from processed spectra counts."""
     X, y, class_names = encode_spectra(spectra_df)
     feature_names = list(CATEGORIES)
+    if not include_sbs96:
+        X = np.empty((len(spectra_df), 0), dtype=np.float32)
+        feature_names = []
+    if include_sbs96_log_counts:
+        counts = spectra_df[CATEGORIES].to_numpy(dtype=np.float32)
+        log_counts = np.log1p(counts).astype(np.float32)
+        X = np.concatenate([X, log_counts], axis=1)
+        feature_names.extend([f"log1p_count_{category}" for category in CATEGORIES])
     if include_mutation_burden:
         counts = spectra_df[CATEGORIES].to_numpy(dtype=np.float32)
         mutation_burden = np.log1p(counts.sum(axis=1, keepdims=True)).astype(np.float32)
@@ -53,6 +73,58 @@ def build_features(spectra_df, include_mutation_burden=False, driver_features_df
         )
         X = np.concatenate([X, driver_matrix], axis=1)
         feature_names.extend(driver_columns)
+    if maf_summary_df is not None:
+        summary_df = maf_summary_df.set_index("sample_id")
+        summary_columns = [column for column in summary_df.columns if column != "sample_id"]
+        missing_samples = set(spectra_df["sample_id"]) - set(summary_df.index)
+        if missing_samples:
+            raise ValueError(
+                f"MAF summary features missing {len(missing_samples)} spectra samples. "
+                "Rebuild the MAF summary feature cache from the same MAF directory."
+            )
+        summary_matrix = (
+            summary_df.reindex(spectra_df["sample_id"].to_numpy())[summary_columns]
+            .fillna(0)
+            .to_numpy(dtype=np.float32)
+        )
+        X = np.concatenate([X, summary_matrix], axis=1)
+        feature_names.extend(summary_columns)
+    if top_gene_features_df is not None:
+        top_gene_df = top_gene_features_df.set_index("sample_id")
+        top_gene_columns = [column for column in top_gene_df.columns if column != "sample_id"]
+        missing_samples = set(spectra_df["sample_id"]) - set(top_gene_df.index)
+        if missing_samples:
+            raise ValueError(
+                f"Top mutated gene features missing {len(missing_samples)} spectra samples. "
+                "Rebuild the top gene feature cache from the same MAF directory."
+            )
+        top_gene_matrix = (
+            top_gene_df.reindex(spectra_df["sample_id"].to_numpy())[top_gene_columns]
+            .fillna(0)
+            .to_numpy(dtype=np.float32)
+        )
+        X = np.concatenate([X, top_gene_matrix], axis=1)
+        feature_names.extend(top_gene_columns)
+    if cosmic_exposures_df is not None:
+        cosmic_df = cosmic_exposures_df.set_index("sample_id")
+        cosmic_columns = [column for column in cosmic_df.columns if column != "sample_id"]
+        missing_samples = set(spectra_df["sample_id"]) - set(cosmic_df.index)
+        if missing_samples:
+            raise ValueError(
+                f"COSMIC exposure features missing {len(missing_samples)} spectra samples. "
+                "Rebuild the COSMIC exposure feature cache from the same processed data."
+            )
+        cosmic_matrix = (
+            cosmic_df.reindex(spectra_df["sample_id"].to_numpy())[cosmic_columns]
+            .fillna(0)
+            .to_numpy(dtype=np.float32)
+        )
+        X = np.concatenate([X, cosmic_matrix], axis=1)
+        feature_names.extend(cosmic_columns)
+    if X.shape[1] == 0:
+        raise ValueError(
+            "No model features selected. Enable SBS96, SBS96 log counts, mutation burden, or driver genes."
+        )
     return X, y, class_names, feature_names
 
 
@@ -60,31 +132,35 @@ class BasicSpectraNN(nn.Module):
     """Configurable MLP classifier for tumor type from normalized SBS spectra."""
 
     def __init__(self, n_features, hidden_dim, n_classes, dropout, num_layers,
-                 bottleneck_dim=None):
+                 bottleneck_dim=None, normalization="batch"):
         super().__init__()
         if num_layers < 1:
             raise ValueError("num_layers must be at least 1.")
+        if normalization not in {"batch", "layer", "none"}:
+            raise ValueError("normalization must be one of: batch, layer, none.")
 
         layers = []
         in_dim = n_features
         for _ in range(num_layers):
-            layers.extend([
-                nn.Linear(in_dim, hidden_dim),
-                nn.BatchNorm1d(hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-            ])
+            layers.append(nn.Linear(in_dim, hidden_dim))
+            if normalization == "batch":
+                layers.append(nn.BatchNorm1d(hidden_dim))
+            elif normalization == "layer":
+                layers.append(nn.LayerNorm(hidden_dim))
+            layers.extend([nn.ReLU(), nn.Dropout(dropout)])
             in_dim = hidden_dim
         self.feature_extractor = nn.Sequential(*layers)
         self.bottleneck_dim = bottleneck_dim
         if bottleneck_dim is not None:
             if bottleneck_dim < 1:
                 raise ValueError("bottleneck_dim must be at least 1.")
-            self.bottleneck = nn.Sequential(
-                nn.Linear(hidden_dim, bottleneck_dim),
-                nn.BatchNorm1d(bottleneck_dim),
-                nn.ReLU(),
-            )
+            bottleneck_layers = [nn.Linear(hidden_dim, bottleneck_dim)]
+            if normalization == "batch":
+                bottleneck_layers.append(nn.BatchNorm1d(bottleneck_dim))
+            elif normalization == "layer":
+                bottleneck_layers.append(nn.LayerNorm(bottleneck_dim))
+            bottleneck_layers.append(nn.ReLU())
+            self.bottleneck = nn.Sequential(*bottleneck_layers)
             in_dim = bottleneck_dim
         else:
             self.bottleneck = None
@@ -112,7 +188,15 @@ def get_device():
     return torch.device("cpu")
 
 
-def make_loaders(X_train, y_train, X_val, y_val, batch_size):
+def make_loaders(
+    X_train,
+    y_train,
+    X_val,
+    y_val,
+    batch_size,
+    balanced_sampling=False,
+    seed=0,
+):
     train_ds = TensorDataset(
         torch.tensor(X_train, dtype=torch.float32),
         torch.tensor(y_train, dtype=torch.long),
@@ -121,7 +205,20 @@ def make_loaders(X_train, y_train, X_val, y_val, batch_size):
         torch.tensor(X_val, dtype=torch.float32),
         torch.tensor(y_val, dtype=torch.long),
     )
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+    sampler = None
+    shuffle = True
+    if balanced_sampling:
+        class_counts = np.bincount(y_train)
+        class_counts = np.maximum(class_counts, 1)
+        sample_weights = 1.0 / class_counts[y_train]
+        sampler = WeightedRandomSampler(
+            weights=torch.tensor(sample_weights, dtype=torch.float32),
+            num_samples=len(sample_weights),
+            replacement=True,
+            generator=torch.Generator().manual_seed(seed),
+        )
+        shuffle = False
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=shuffle, sampler=sampler)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
     return train_loader, val_loader
 
@@ -134,9 +231,28 @@ def compute_class_weights(y_train, n_classes):
     return weights.astype(np.float32)
 
 
+def monitor_score(row, monitor):
+    if monitor == "val_loss":
+        return -row["val_loss"]
+    if monitor == "val_acc":
+        return row["val_acc"]
+    raise ValueError(f"Unsupported monitor: {monitor}")
+
+
 def l1_penalty(model):
     """L1 parameter penalty for sparse/smaller weights."""
     return sum(param.abs().sum() for param in model.parameters())
+
+
+def fit_standardizer(X_train):
+    mean = X_train.mean(axis=0, keepdims=True).astype(np.float32)
+    scale = X_train.std(axis=0, keepdims=True).astype(np.float32)
+    scale = np.where(scale < 1e-6, 1.0, scale).astype(np.float32)
+    return mean, scale
+
+
+def apply_standardizer(X, mean, scale):
+    return ((X - mean) / scale).astype(np.float32)
 
 
 @torch.no_grad()
@@ -151,6 +267,48 @@ def evaluate(model, X, y, device, label_smoothing=0.0):
     return loss, accuracy, preds
 
 
+@torch.no_grad()
+def top_k_accuracy(model, X, y, device, k_values=(2, 3)):
+    model.eval()
+    Xt = torch.tensor(X, dtype=torch.float32, device=device)
+    logits = model(Xt)
+    max_k = min(max(k_values), logits.shape[1])
+    topk = logits.topk(max_k, dim=1).indices.cpu().numpy()
+    out = {}
+    for k in k_values:
+        effective_k = min(k, logits.shape[1])
+        out[f"top_{k}_accuracy"] = float(
+            np.any(topk[:, :effective_k] == y[:, None], axis=1).mean()
+        )
+    return out
+
+
+def load_or_build_cosmic_exposure_features(
+    spectra_df,
+    cosmic_path,
+    cache_path,
+    force=False,
+):
+    cache_path = Path(cache_path)
+    if cache_path.exists() and not force:
+        return pd.read_csv(cache_path)
+
+    counts = spectra_df[CATEGORIES].to_numpy(dtype=np.float64)
+    row_sums = counts.sum(axis=1, keepdims=True)
+    row_sums = np.where(row_sums == 0, 1.0, row_sums)
+    spectra_probs = counts / row_sums
+    cosmic_matrix, cosmic_names = load_cosmic_signatures(cosmic_path)
+    exposures = fit_exposures(spectra_probs, cosmic_matrix)
+    exposure_df = pd.DataFrame(
+        exposures,
+        columns=[f"cosmic_exposure_{name}" for name in cosmic_names],
+    )
+    exposure_df.insert(0, "sample_id", spectra_df["sample_id"].to_numpy())
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    exposure_df.to_csv(cache_path, index=False)
+    return exposure_df
+
+
 def train_model(X_train, y_train, X_val, y_val, args, n_classes):
     device = get_device()
     torch.manual_seed(args.seed)
@@ -163,6 +321,7 @@ def train_model(X_train, y_train, X_val, y_val, args, n_classes):
         dropout=args.dropout,
         num_layers=args.num_layers,
         bottleneck_dim=args.bottleneck_dim,
+        normalization=args.normalization,
     ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -182,10 +341,14 @@ def train_model(X_train, y_train, X_val, y_val, args, n_classes):
         X_val,
         y_val,
         args.batch_size,
+        balanced_sampling=args.balanced_sampler,
+        seed=args.seed,
     )
 
-    best_val_acc = -1.0
+    best_score = -float("inf")
+    best_epoch = -1
     best_state = None
+    stale_epochs = 0
     history = []
 
     for epoch in range(args.epochs):
@@ -221,9 +384,14 @@ def train_model(X_train, y_train, X_val, y_val, args, n_classes):
         }
         history.append(row)
 
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        score = monitor_score(row, args.monitor)
+        if score > best_score + args.early_stopping_min_delta:
+            best_score = score
+            best_epoch = epoch
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            stale_epochs = 0
+        else:
+            stale_epochs += 1
 
         if args.print_every > 0 and (epoch % args.print_every == 0 or epoch == args.epochs - 1):
             print(
@@ -233,9 +401,18 @@ def train_model(X_train, y_train, X_val, y_val, args, n_classes):
                 flush=True,
             )
 
+        if args.early_stopping_patience > 0 and stale_epochs >= args.early_stopping_patience:
+            if args.print_every > 0:
+                print(
+                    f"early stopping at epoch {epoch:03d}; "
+                    f"best_epoch={best_epoch:03d} monitor={args.monitor}",
+                    flush=True,
+                )
+            break
+
     if best_state is not None:
         model.load_state_dict(best_state)
-    return model, history, str(device)
+    return model, history, str(device), best_epoch, best_score
 
 
 def _polyline(points):
@@ -497,7 +674,7 @@ def save_bottleneck_visualizations(
     viz_prefix,
 ):
     """Save bottleneck activations, class means, classifier weights, and heatmaps."""
-    if viz_prefix is None or model.bottleneck is None:
+    if not viz_prefix or model.bottleneck is None:
         return {}
 
     prefix = Path(viz_prefix)
@@ -665,6 +842,14 @@ def main():
     parser.add_argument("--bottleneck-dim", type=int, default=None,
                         help="Optional bottleneck layer width before classification.")
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--normalization", choices=["batch", "layer", "none"], default="batch",
+                        help="Hidden-layer normalization type.")
+    parser.add_argument("--feature-standardize", action="store_true",
+                        help="Z-score model features using training-set mean and std.")
+    parser.add_argument("--exclude-sbs96", action="store_true",
+                        help="Remove the 96 normalized SBS spectrum features.")
+    parser.add_argument("--include-sbs96-log-counts", action="store_true",
+                        help="Append log1p raw count for each SBS96 channel.")
     parser.add_argument("--include-mutation-burden", action="store_true",
                         help="Append log1p(total SNV count) as an additional feature.")
     parser.add_argument("--include-driver-genes", action="store_true",
@@ -677,9 +862,45 @@ def main():
                         help="Raw cached MAF directory used to build driver flags.")
     parser.add_argument("--force-driver-rebuild", action="store_true",
                         help="Reparse MAFs and overwrite --driver-feature-cache.")
+    parser.add_argument("--include-maf-summary-features", action="store_true",
+                        help="Append MAF-derived consequence/type/impact log-count features.")
+    parser.add_argument("--maf-summary-feature-cache",
+                        default="data/processed/maf_summary_features.csv",
+                        help="CSV cache for per-sample MAF summary features.")
+    parser.add_argument("--force-maf-summary-rebuild", action="store_true",
+                        help="Reparse MAFs and overwrite --maf-summary-feature-cache.")
+    parser.add_argument("--include-top-mutated-genes", action="store_true",
+                        help="Append flags for the most frequently mutated genes in the MAF set.")
+    parser.add_argument("--top-gene-feature-cache",
+                        default="data/processed/top_mutated_gene_flags.csv",
+                        help="CSV cache for top mutated gene flags.")
+    parser.add_argument("--top-gene-count", type=int, default=1000,
+                        help="Number of top mutated genes to keep when building top-gene features.")
+    parser.add_argument("--top-gene-min-samples", type=int, default=5,
+                        help="Minimum mutated samples required for a top-gene feature.")
+    parser.add_argument("--force-top-gene-rebuild", action="store_true",
+                        help="Reparse MAFs and overwrite --top-gene-feature-cache.")
+    parser.add_argument("--include-cosmic-exposures", action="store_true",
+                        help="Append NNLS-fitted COSMIC SBS exposure features.")
+    parser.add_argument("--cosmic-path",
+                        default="data/COSMIC_Human_SBS-96_GRCh38_v3.6.csv",
+                        help="COSMIC SBS signature matrix for exposure features.")
+    parser.add_argument("--cosmic-exposure-cache",
+                        default="data/processed/cosmic_exposure_features.csv",
+                        help="CSV cache for per-sample COSMIC exposure features.")
+    parser.add_argument("--force-cosmic-exposure-rebuild", action="store_true",
+                        help="Recompute and overwrite --cosmic-exposure-cache.")
     parser.add_argument("--no-class-weights", action="store_true",
                         help="Disable inverse-frequency class weighting in cross entropy.")
+    parser.add_argument("--balanced-sampler", action="store_true",
+                        help="Sample training batches with inverse-frequency class weights.")
     parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--early-stopping-patience", type=int, default=0,
+                        help="Stop after this many epochs without monitor improvement. 0 disables.")
+    parser.add_argument("--early-stopping-min-delta", type=float, default=0.0,
+                        help="Minimum monitor improvement required to reset early stopping.")
+    parser.add_argument("--monitor", choices=["val_acc", "val_loss"], default="val_acc",
+                        help="Validation metric used for best checkpoint and early stopping.")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -714,11 +935,40 @@ def main():
             driver_genes=driver_genes,
             force=args.force_driver_rebuild,
         )
+    maf_summary_df = None
+    if args.include_maf_summary_features:
+        maf_summary_df = load_or_build_maf_summary_features(
+            cache_path=args.maf_summary_feature_cache,
+            data_dir=args.data_dir,
+            force=args.force_maf_summary_rebuild,
+        )
+    top_gene_features_df = None
+    if args.include_top_mutated_genes:
+        top_gene_features_df = load_or_build_top_mutated_gene_features(
+            cache_path=args.top_gene_feature_cache,
+            data_dir=args.data_dir,
+            max_genes=args.top_gene_count,
+            min_samples=args.top_gene_min_samples,
+            force=args.force_top_gene_rebuild,
+        )
+    cosmic_exposures_df = None
+    if args.include_cosmic_exposures:
+        cosmic_exposures_df = load_or_build_cosmic_exposure_features(
+            spectra_df=spectra_df,
+            cosmic_path=args.cosmic_path,
+            cache_path=args.cosmic_exposure_cache,
+            force=args.force_cosmic_exposure_rebuild,
+        )
 
     X, y, class_names, feature_names = build_features(
         spectra_df,
+        include_sbs96=not args.exclude_sbs96,
+        include_sbs96_log_counts=args.include_sbs96_log_counts,
         include_mutation_burden=args.include_mutation_burden,
         driver_features_df=driver_features_df,
+        maf_summary_df=maf_summary_df,
+        top_gene_features_df=top_gene_features_df,
+        cosmic_exposures_df=cosmic_exposures_df,
     )
     X_train, X_tmp, y_train, y_tmp = train_test_split(
         X,
@@ -735,8 +985,19 @@ def main():
         stratify=y_tmp,
         random_state=args.seed,
     )
+    standardizer = None
+    if args.feature_standardize:
+        feature_mean, feature_scale = fit_standardizer(X_train)
+        X_train = apply_standardizer(X_train, feature_mean, feature_scale)
+        X_val = apply_standardizer(X_val, feature_mean, feature_scale)
+        X_test = apply_standardizer(X_test, feature_mean, feature_scale)
+        X = apply_standardizer(X, feature_mean, feature_scale)
+        standardizer = {
+            "mean": feature_mean.reshape(-1).tolist(),
+            "scale": feature_scale.reshape(-1).tolist(),
+        }
 
-    model, history, device = train_model(
+    model, history, device, best_epoch, best_score = train_model(
         X_train,
         y_train,
         X_val,
@@ -747,6 +1008,7 @@ def main():
     test_loss, test_acc, test_preds = evaluate(
         model, X_test, y_test, get_device(), label_smoothing=args.label_smoothing)
     metrics = classification_metrics(y_test, test_preds, class_names=class_names)
+    metrics.update(top_k_accuracy(model, X_test, y_test, get_device(), k_values=(2, 3)))
     visualization_outputs = save_bottleneck_visualizations(
         model=model,
         X=X,
@@ -773,16 +1035,41 @@ def main():
         "num_layers": args.num_layers,
         "bottleneck_dim": args.bottleneck_dim,
         "dropout": args.dropout,
+        "normalization": args.normalization,
+        "feature_standardize": args.feature_standardize,
+        "include_sbs96": not args.exclude_sbs96,
+        "include_sbs96_log_counts": args.include_sbs96_log_counts,
         "include_mutation_burden": args.include_mutation_burden,
         "include_driver_genes": args.include_driver_genes,
+        "include_maf_summary_features": args.include_maf_summary_features,
+        "include_top_mutated_genes": args.include_top_mutated_genes,
+        "include_cosmic_exposures": args.include_cosmic_exposures,
         "driver_feature_cache": args.driver_feature_cache if args.include_driver_genes else None,
         "driver_gene_file": args.driver_gene_file if args.include_driver_genes else None,
         "driver_genes": driver_genes if args.include_driver_genes else None,
+        "maf_summary_feature_cache": (
+            args.maf_summary_feature_cache if args.include_maf_summary_features else None
+        ),
+        "top_gene_feature_cache": (
+            args.top_gene_feature_cache if args.include_top_mutated_genes else None
+        ),
+        "top_gene_count": args.top_gene_count if args.include_top_mutated_genes else None,
+        "top_gene_min_samples": args.top_gene_min_samples if args.include_top_mutated_genes else None,
+        "cosmic_path": args.cosmic_path if args.include_cosmic_exposures else None,
+        "cosmic_exposure_cache": (
+            args.cosmic_exposure_cache if args.include_cosmic_exposures else None
+        ),
         "class_weighted_cross_entropy": not args.no_class_weights,
+        "balanced_sampler": args.balanced_sampler,
         "class_weights": (
             compute_class_weights(y_train, len(class_names)).tolist()
             if not args.no_class_weights else None
         ),
+        "best_epoch": int(best_epoch),
+        "best_monitor": args.monitor,
+        "best_monitor_score": float(best_score),
+        "early_stopping_patience": args.early_stopping_patience,
+        "early_stopping_min_delta": args.early_stopping_min_delta,
         "n_features": int(X.shape[1]),
         "epochs": args.epochs,
         "batch_size": args.batch_size,
@@ -819,6 +1106,7 @@ def main():
             "class_names": class_names,
             "feature_names": feature_names,
             "config": config,
+            "standardizer": standardizer,
         },
         model_path,
     )
@@ -828,7 +1116,10 @@ def main():
     print(f"  train/val/test: {len(y_train)}/{len(y_val)}/{len(y_test)}")
     print(f"  classes: {class_names}")
     print(f"  test accuracy: {metrics['accuracy']:.3f}")
+    print(f"  test top-2 accuracy: {metrics['top_2_accuracy']:.3f}")
+    print(f"  test top-3 accuracy: {metrics['top_3_accuracy']:.3f}")
     print(f"  test weighted_f1: {metrics['weighted_f1']:.3f}")
+    print(f"  best epoch: {best_epoch} ({args.monitor} score {best_score:.4f})")
     print(f"  results saved to {out_path}")
     print(f"  model saved to {model_path}")
     if args.plot_out:
